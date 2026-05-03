@@ -199,6 +199,7 @@ export default function ReviewPage() {
                       alt="Recibo"
                       className="max-h-64 max-w-full object-contain block"
                       draggable={false}
+                      crossOrigin="anonymous"
                     />
                     {/* ROI Selection Rectangle */}
                     {roiMode && roiRect && roiRect.w > 5 && roiRect.h > 5 && (
