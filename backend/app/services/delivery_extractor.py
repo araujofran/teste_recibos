@@ -214,27 +214,58 @@ class DeliveryDataExtractor:
 
     # ─── Endereço ─────────────────────────────────────────────────────────────
     def _extract_address(self, text: str, lines: list, result: DeliveryExtractionResult):
-        # 1. Keyword explícita
+        """
+        Estratégia:
+        1. Encontra a linha-âncora de entrega (Hora p/Entrega, Cliente, Telefone).
+        2. Busca endereços SOMENTE abaixo dessa âncora → evita capturar o endereço do estabelecimento.
+        3. Fallback: keyword explícita "Endereço:", "Entrega:".
+        4. Último recurso: segunda ocorrência de logradouro no texto.
+        """
+
+        # ── 1. Encontrar índice da âncora de entrega ──────────────────────────
+        anchor_idx = None
+        anchor_patterns = re.compile(
+            r'(hora\s*p[/.]?\s*entrega|cliente\s*:|telefone\s*:|celular\s*:|fone\s*:)',
+            re.IGNORECASE
+        )
+        for i, line in enumerate(lines):
+            if anchor_patterns.search(line):
+                anchor_idx = i
+                break
+
+        # ── 2. Buscar endereço ABAIXO da âncora ───────────────────────────────
+        search_lines = lines[anchor_idx:] if anchor_idx is not None else lines
+
+        for i, line in enumerate(search_lines):
+            if ADDRESS_PREFIXES.match(line):
+                addr = line
+                # Concatena próxima linha se parece complemento / bairro / cidade
+                if i + 1 < len(search_lines):
+                    next_l = search_lines[i + 1].strip()
+                    if (not ADDRESS_PREFIXES.match(next_l)
+                            and len(next_l) < 80
+                            and re.search(r'(SP|RJ|MG|bairro|jardim|parque|vila|centro|rafael|pirani)', next_l, re.IGNORECASE)):
+                        addr = f"{addr}, {next_l}"
+                result.address_raw = DeliveryField(value=addr.strip(), confidence=0.88, source="heuristic")
+                self._parse_address_parts(addr, lines, text, result)
+                return
+
+        # ── 3. Keyword explícita em qualquer posição ───────────────────────────
         m = ADDRESS_KEYWORDS.search(text)
         if m:
             addr = m.group(1).strip().split("\n")[0].strip()
             if len(addr) > 5:
-                result.address_raw = DeliveryField(value=addr, confidence=0.90, source="heuristic")
+                result.address_raw = DeliveryField(value=addr, confidence=0.85, source="heuristic")
                 self._parse_address_parts(addr, lines, text, result)
                 return
 
-        # 2. Linha que começa com prefixo de logradouro
-        for i, line in enumerate(lines):
-            if ADDRESS_PREFIXES.match(line):
-                # Concatena linha seguinte se parecer ser bairro/complemento
-                addr = line
-                if i + 1 < len(lines):
-                    next_l = lines[i + 1]
-                    if not ADDRESS_PREFIXES.match(next_l) and len(next_l) < 80:
-                        addr = f"{addr}, {next_l}"
-                result.address_raw = DeliveryField(value=addr, confidence=0.80, source="heuristic")
-                self._parse_address_parts(addr, lines, text, result)
-                return
+        # ── 4. Último recurso: segunda ocorrência de logradouro ───────────────
+        occurrences = [line for line in lines if ADDRESS_PREFIXES.match(line)]
+        if len(occurrences) >= 2:
+            addr = occurrences[1]   # pula o endereço do estabelecimento (1ª ocorrência)
+            result.address_raw = DeliveryField(value=addr.strip(), confidence=0.55, source="heuristic")
+            self._parse_address_parts(addr, lines, text, result)
+
 
     def _parse_address_parts(self, addr: str, lines: list, text: str, result: DeliveryExtractionResult):
         # Número

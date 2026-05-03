@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import axios from "axios";
-import { Check, X, AlertTriangle, Save, Play, RefreshCw, ChevronRight } from "lucide-react";
+import { Check, X, AlertTriangle, Save, Play, RefreshCw, ChevronRight, Crop, Scissors } from "lucide-react";
 
 const API_BASE_URL = "http://localhost:8000";
 
@@ -14,7 +14,16 @@ export default function ReviewPage() {
   const [groundTruth, setGroundTruth] = useState<string>("");
   const [validation, setValidation] = useState<any>(null);
   const [loading, setLoading] = useState(false);
-  const [selectedProvider, setSelectedProvider] = useState<string>("gemini");
+  const [selectedProvider, setSelectedProvider] = useState<string>("veryfi");
+
+  // ROI Selector state
+  const [roiMode, setRoiMode] = useState(false);
+  const [roiRect, setRoiRect] = useState<{x:number,y:number,w:number,h:number}|null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState<{x:number,y:number}|null>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
+
 
 
   useEffect(() => {
@@ -71,6 +80,62 @@ export default function ReviewPage() {
     }
   };
 
+  // ─── ROI helpers ─────────────────────────────────────────────────────────────
+  const getRelativePos = (e: React.MouseEvent) => {
+    const img = imgRef.current;
+    if (!img) return { x: 0, y: 0 };
+    const rect = img.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(e.clientX - rect.left, rect.width)),
+      y: Math.max(0, Math.min(e.clientY - rect.top, rect.height)),
+    };
+  };
+  const onMouseDown = (e: React.MouseEvent) => {
+    if (!roiMode) return;
+    e.preventDefault();
+    const pos = getRelativePos(e);
+    setDragStart(pos);
+    setRoiRect(null);
+    setIsDragging(true);
+  };
+  const onMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging || !dragStart) return;
+    const pos = getRelativePos(e);
+    setRoiRect({
+      x: Math.min(pos.x, dragStart.x),
+      y: Math.min(pos.y, dragStart.y),
+      w: Math.abs(pos.x - dragStart.x),
+      h: Math.abs(pos.y - dragStart.y),
+    });
+  };
+  const onMouseUp = () => setIsDragging(false);
+
+  const extractROI = async () => {
+    if (!roiRect || !imgRef.current || !selectedImage) return;
+    setLoading(true);
+    try {
+      const img = imgRef.current;
+      const scaleX = img.naturalWidth  / img.getBoundingClientRect().width;
+      const scaleY = img.naturalHeight / img.getBoundingClientRect().height;
+      const canvas = document.createElement("canvas");
+      canvas.width  = Math.round(roiRect.w * scaleX);
+      canvas.height = Math.round(roiRect.h * scaleY);
+      const ctx = canvas.getContext("2d")!;
+      ctx.drawImage(img,
+        roiRect.x * scaleX, roiRect.y * scaleY, roiRect.w * scaleX, roiRect.h * scaleY,
+        0, 0, canvas.width, canvas.height);
+      const base64 = canvas.toDataURL("image/jpeg", 0.92);
+      await axios.post(`${API_BASE_URL}/extract-region/${selectedImage.id}`, { image_base64: base64 });
+      fetchExtractions(selectedImage.id);
+      setRoiMode(false);
+      setRoiRect(null);
+    } catch (err: any) {
+      alert("Erro na extração da região: " + (err.response?.data?.detail || err.message));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col gap-6">
       <header className="flex justify-between items-center">
@@ -90,6 +155,7 @@ export default function ReviewPage() {
         <div className="col-span-3 bg-white rounded-2xl border border-slate-200 overflow-hidden flex flex-col shadow-sm">
           <div className="p-4 border-b border-slate-100 font-semibold text-slate-800 bg-slate-50">
             Recibos Enviados
+
           </div>
           <div className="flex-1 overflow-y-auto p-2 space-y-1">
             {images.map((img) => (
@@ -114,15 +180,84 @@ export default function ReviewPage() {
         <div className="col-span-9 grid grid-rows-2 gap-6">
           {/* Top: Image Preview & JSON Extraction */}
           <div className="grid grid-cols-2 gap-6">
-            <div className="bg-slate-200 rounded-2xl overflow-hidden border border-slate-300 relative group flex items-center justify-center bg-checkered">
+            {/* Image with ROI selector */}
+            <div className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-700 relative flex items-center justify-center" style={{minHeight: 280}}>
               {selectedImage ? (
-                <img 
-                  src={`${API_BASE_URL}/${selectedImage.file_url}`} 
-                  alt="Recibo" 
-                  className="max-h-full max-w-full object-contain"
-                />
+                <>
+                  {/* Image with event listeners for ROI */}
+                  <div
+                    className="relative select-none"
+                    style={{cursor: roiMode ? 'crosshair' : 'default'}}
+                    onMouseDown={onMouseDown}
+                    onMouseMove={onMouseMove}
+                    onMouseUp={onMouseUp}
+                    onMouseLeave={onMouseUp}
+                  >
+                    <img
+                      ref={imgRef}
+                      src={`${API_BASE_URL}/${selectedImage.file_url}`}
+                      alt="Recibo"
+                      className="max-h-64 max-w-full object-contain block"
+                      draggable={false}
+                    />
+                    {/* ROI Selection Rectangle */}
+                    {roiMode && roiRect && roiRect.w > 5 && roiRect.h > 5 && (
+                      <div
+                        className="absolute border-2 border-yellow-400 bg-yellow-400/20 pointer-events-none"
+                        style={{
+                          left: roiRect.x, top: roiRect.y,
+                          width: roiRect.w, height: roiRect.h
+                        }}
+                      >
+                        {/* Corner handles */}
+                        {[{t:'0%',l:'0%'},{t:'0%',l:'100%'},{t:'100%',l:'0%'},{t:'100%',l:'100%'}].map((c,i) => (
+                          <div key={i} className="absolute w-2 h-2 bg-yellow-400 rounded-full" style={{top:c.t,left:c.l,transform:'translate(-50%,-50%)'}}/>
+                        ))}
+                      </div>
+                    )}
+                    {/* ROI mode hint */}
+                    {roiMode && !isDragging && !roiRect && (
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                        <div className="bg-black/60 text-yellow-300 text-xs px-3 py-2 rounded-lg text-center">
+                          🎯 Arraste para selecionar<br/>a seção de entrega
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ROI Controls */}
+                  <div className="absolute bottom-2 left-0 right-0 flex justify-center gap-2">
+                    {!roiMode ? (
+                      <button
+                        onClick={() => { setRoiMode(true); setRoiRect(null); }}
+                        className="flex items-center gap-1.5 text-[11px] bg-yellow-500 hover:bg-yellow-400 text-black font-bold px-3 py-1.5 rounded-lg shadow-lg transition-all"
+                      >
+                        <Scissors size={12}/> Selecionar Região
+                      </button>
+                    ) : (
+                      <>
+                        {roiRect && roiRect.w > 10 && (
+                          <button
+                            onClick={extractROI}
+                            disabled={loading}
+                            className="flex items-center gap-1.5 text-[11px] bg-green-500 hover:bg-green-400 text-white font-bold px-3 py-1.5 rounded-lg shadow-lg transition-all disabled:opacity-50"
+                          >
+                            {loading ? <RefreshCw size={12} className="animate-spin"/> : <Play size={12}/>}
+                            Extrair Região
+                          </button>
+                        )}
+                        <button
+                          onClick={() => { setRoiMode(false); setRoiRect(null); }}
+                          className="flex items-center gap-1.5 text-[11px] bg-slate-600 hover:bg-slate-500 text-white px-3 py-1.5 rounded-lg shadow-lg transition-all"
+                        >
+                          <X size={12}/> Cancelar
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </>
               ) : (
-                <p className="text-slate-400 italic">Selecione um recibo</p>
+                <p className="text-slate-400 italic text-sm">Selecione um recibo</p>
               )}
             </div>
 
@@ -210,66 +345,91 @@ export default function ReviewPage() {
                         </div>
                       </div>
 
-                      {/* Dados do Cliente de Entrega */}
+                      {/* Dados do Cliente de Entrega - GeminiDeliveryExtractor */}
                       {(() => {
                         const de = selectedExtraction.normalized_json.delivery_extraction;
-                        const conf = de?.overall_confidence ?? 0;
-                        const needsReview = de?.precisa_revisao ?? false;
+                        const conf = de?.confidence?.overall ?? 0;
+                        const needsReview = de?.needs_human_review ?? true;
+                        const autoApprove = de?.auto_approve_logistics ?? false;
                         return (
-                          <div className={`p-3 rounded border ${needsReview ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-200'}`}>
+                          <div className={`p-3 rounded border ${autoApprove ? 'bg-green-50 border-green-300' : needsReview ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-200'}`}>
                             <div className="flex items-center justify-between mb-2">
-                              <p className={`text-[10px] font-bold uppercase ${needsReview ? 'text-red-700' : 'text-amber-700'}`}>
+                              <p className={`text-[10px] font-bold uppercase ${autoApprove ? 'text-green-700' : needsReview ? 'text-red-700' : 'text-amber-700'}`}>
                                 📦 Dados de Entrega
+                                {autoApprove && ' ✅'}
                               </p>
                               <div className="flex items-center gap-2">
                                 <div className="flex items-center gap-1">
                                   <div className="w-16 h-1.5 bg-slate-200 rounded-full overflow-hidden">
-                                    <div className={`h-full rounded-full ${conf >= 0.7 ? 'bg-green-500' : conf >= 0.4 ? 'bg-yellow-500' : 'bg-red-500'}`} style={{width: `${conf * 100}%`}}/>
+                                    <div className={`h-full rounded-full transition-all ${conf >= 0.85 ? 'bg-green-500' : conf >= 0.7 ? 'bg-yellow-500' : 'bg-red-500'}`} style={{width: `${conf * 100}%`}}/>
                                   </div>
                                   <span className="text-[9px] text-slate-500">{Math.round(conf * 100)}%</span>
                                 </div>
-                                {needsReview && (
+                                {autoApprove ? (
+                                  <span className="text-[9px] bg-green-100 text-green-700 px-1.5 py-0.5 rounded-full font-bold">✅ LOGÍSTICA</span>
+                                ) : needsReview ? (
                                   <span className="text-[9px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full font-bold">⚠ REVISAR</span>
-                                )}
+                                ) : null}
                               </div>
                             </div>
+
                             <div className="grid grid-cols-2 gap-2 text-xs">
                               <div>
                                 <p className="text-[10px] text-slate-400 font-bold uppercase">Cliente</p>
                                 <p className="font-semibold text-slate-800">
-                                  {de?.customer_name?.value || selectedExtraction.normalized_json.customer?.name || '---'}
-                                  {de?.customer_name?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.customer_name.confidence*100)}%)</span>}
+                                  {de?.customer_name || selectedExtraction.normalized_json.customer?.name || '---'}
+                                  {de?.confidence?.customer_name > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round((de.confidence.customer_name)*100)}%)</span>}
                                 </p>
                               </div>
                               <div>
                                 <p className="text-[10px] text-slate-400 font-bold uppercase">Telefone</p>
                                 <p className="font-semibold text-slate-800">
-                                  {de?.phone?.value || selectedExtraction.normalized_json.customer?.phone || '---'}
-                                  {de?.phone?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.phone.confidence*100)}%)</span>}
+                                  {de?.customer_phone || selectedExtraction.normalized_json.customer?.phone || '---'}
+                                  {de?.confidence?.customer_phone > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round((de.confidence.customer_phone)*100)}%)</span>}
                                 </p>
                               </div>
                             </div>
+
                             <div className="mt-2">
                               <p className="text-[10px] text-slate-400 font-bold uppercase">Endereço de Entrega</p>
                               <p className="text-xs text-slate-700 font-medium mt-0.5">
-                                {de?.address_raw?.value || selectedExtraction.normalized_json.delivery?.address_raw || '---'}
-                                {de?.address_raw?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.address_raw.confidence*100)}%)</span>}
+                                {de?.delivery_address_raw || selectedExtraction.normalized_json.delivery?.address_raw || '---'}
+                                {de?.confidence?.address > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round((de.confidence.address)*100)}%)</span>}
                               </p>
-                              {(de?.neighborhood?.value || de?.city?.value) && (
+                              {(de?.neighborhood || de?.city) && (
                                 <p className="text-[10px] text-slate-500 mt-0.5">
-                                  {[de?.neighborhood?.value, de?.city?.value, de?.state?.value].filter(Boolean).join(' - ')}
+                                  {[de?.neighborhood, de?.city, de?.state].filter(Boolean).join(' - ')}
                                 </p>
                               )}
+                              {de?.reference && (
+                                <p className="text-[10px] text-slate-400 italic mt-0.5">Ref: {de.reference}</p>
+                              )}
                             </div>
-                            {de?.delivery_time?.value && (
-                              <div className="mt-2">
-                                <p className="text-[10px] text-slate-400 font-bold uppercase">Hora p/ Entrega</p>
-                                <p className={`text-xs font-bold ${needsReview ? 'text-red-700' : 'text-amber-700'}`}>{de.delivery_time.value}</p>
+
+                            {/* Evidências do Gemini */}
+                            {de?.evidence && (de.evidence.address_text || de.evidence.customer_name_text) && (
+                              <details className="mt-2">
+                                <summary className="text-[9px] text-slate-400 cursor-pointer hover:text-slate-600">🔍 Evidências do Gemini</summary>
+                                <div className="mt-1 space-y-1">
+                                  {de.evidence.customer_name_text && <p className="text-[9px] bg-white px-1.5 py-0.5 rounded border border-slate-100 text-slate-600">Nome: "{de.evidence.customer_name_text}"</p>}
+                                  {de.evidence.phone_text && <p className="text-[9px] bg-white px-1.5 py-0.5 rounded border border-slate-100 text-slate-600">Tel: "{de.evidence.phone_text}"</p>}
+                                  {de.evidence.address_text && <p className="text-[9px] bg-white px-1.5 py-0.5 rounded border border-slate-100 text-slate-600">End: "{de.evidence.address_text}"</p>}
+                                </div>
+                              </details>
+                            )}
+
+                            {/* Motivos de revisão */}
+                            {needsReview && de?.reason?.length > 0 && (
+                              <div className="mt-2 space-y-0.5">
+                                {de.reason.map((r: string, i: number) => (
+                                  <p key={i} className="text-[9px] text-red-600">• {r}</p>
+                                ))}
                               </div>
                             )}
                           </div>
                         );
                       })()}
+
 
 
                       <div className="mt-2">

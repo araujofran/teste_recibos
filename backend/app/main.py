@@ -167,3 +167,123 @@ def run_validation(extraction_id: str, db: Session = Depends(get_db)):
     return {"validation_id": validation.id, "status": validation.status, "score": validation.score_overall, "metrics": validation.metrics_json}
 
 
+# ─── Endpoint: Extração por Região (ROI) ──────────────────────────────────────
+from pydantic import BaseModel as PydanticBase
+import base64 as b64lib, tempfile, json as jsonlib
+
+class ROIRequest(PydanticBase):
+    image_base64: str   # data:image/jpeg;base64,....
+
+@app.post("/extract-region/{image_id}")
+async def extract_region(image_id: str, body: ROIRequest, db: Session = Depends(get_db)):
+    """
+    Recebe uma região da imagem (base64) selecionada pelo usuário,
+    envia ao GeminiDeliveryExtractor e salva como nova extração.
+    """
+    from .services.gemini_delivery_extractor import gemini_delivery_extractor
+
+    # Decodifica base64
+    try:
+        header, b64data = body.image_base64.split(",", 1)
+        img_bytes = b64lib.b64decode(b64data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"base64 inválido: {e}")
+
+    # Salva imagem recortada temporariamente para OCR de texto
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(img_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # Usa Gemini Vision diretamente na região (mais preciso que raw_text)
+        import google.generativeai as genai
+        import os
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = """Você é um extrator de dados de entrega.
+Analise esta imagem (recorte de um recibo) e extraia SOMENTE os dados de entrega.
+Retorne EXCLUSIVAMENTE JSON válido:
+{
+  "customer_name": "",
+  "customer_phone": "",
+  "delivery_address_raw": "",
+  "street": "", "number": "", "complement": "",
+  "neighborhood": "", "city": "", "state": "", "zip_code": "",
+  "reference": "",
+  "confidence": {"customer_name": 0.0, "customer_phone": 0.0, "address": 0.0, "overall": 0.0},
+  "evidence": {"customer_name_text": "", "phone_text": "", "address_text": ""},
+  "needs_human_review": true,
+  "reason": []
+}
+Não invente dados. Se não tiver certeza, deixe o campo vazio."""
+
+        img_part = {"mime_type": "image/jpeg", "data": img_bytes}
+        response = model.generate_content([prompt, img_part])
+        content = response.text.strip()
+
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+
+        de_result = jsonlib.loads(content.strip())
+        de_result["auto_approve_logistics"] = de_result.get("confidence", {}).get("overall", 0) >= 0.85
+
+    except Exception as e:
+        de_result = {
+            "customer_name": "", "customer_phone": "", "delivery_address_raw": "",
+            "street": "", "number": "", "complement": "", "neighborhood": "",
+            "city": "", "state": "", "zip_code": "", "reference": "",
+            "confidence": {"customer_name": 0, "customer_phone": 0, "address": 0, "overall": 0},
+            "evidence": {"customer_name_text": "", "phone_text": "", "address_text": ""},
+            "needs_human_review": True,
+            "auto_approve_logistics": False,
+            "reason": [f"Erro Gemini ROI: {str(e)}"]
+        }
+    finally:
+        os.unlink(tmp_path)
+
+    # Monta schema padronizado
+    normalized = {
+        "provider": "gemini-roi",
+        "document_id": None,
+        "image_id": image_id,
+        "merchant": {"name": None, "cnpj": None, "address": None, "phone": None},
+        "document": {"issue_date": None, "issue_time": None, "number": None},
+        "customer": {
+            "name": de_result.get("customer_name"),
+            "phone": de_result.get("customer_phone"),
+        },
+        "delivery": {
+            "address_raw": de_result.get("delivery_address_raw"),
+            "street": de_result.get("street"),
+            "number": de_result.get("number"),
+            "complement": de_result.get("complement"),
+            "neighborhood": de_result.get("neighborhood"),
+            "city": de_result.get("city"),
+            "state": de_result.get("state"),
+            "zip_code": de_result.get("zip_code"),
+            "reference": de_result.get("reference"),
+        },
+        "items": [],
+        "payment": {"total": None, "subtotal": None, "delivery_fee": None, "payment_method": None},
+        "raw_text": None,
+        "delivery_extraction": de_result,
+        "confidence": {"status": None, "score": None, "errors": [], "warnings": [], "needs_human_review": de_result.get("needs_human_review", True)},
+        "validation": {"status": None, "score": None, "errors": [], "warnings": [], "needs_human_review": de_result.get("needs_human_review", True)},
+    }
+
+    # Salva extração
+    extraction = models.ReceiptExtraction(
+        image_id=image_id,
+        provider_id="gemini-roi",
+        raw_json=de_result,
+        normalized_json=normalized,
+        status="roi_extracted"
+    )
+    db.add(extraction)
+    db.commit()
+    db.refresh(extraction)
+
+    return {"extraction_id": extraction.id, "provider": "gemini-roi", "result": de_result}

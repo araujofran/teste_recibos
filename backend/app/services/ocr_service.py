@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from collections import deque
 from app.schemas import ReceiptStandardSchema, ItemSchema
 from app.services.delivery_extractor import delivery_extractor
+from app.services.gemini_delivery_extractor import gemini_delivery_extractor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -320,41 +321,40 @@ class VeryfiProvider(ReceiptProviderInterface):
             except Exception:
                 continue
 
-        # ── Segunda camada: DeliveryDataExtractor ──────────────────────────────
+        # ── Segunda camada: GeminiDeliveryExtractor (semântico) ─────────────────
         ocr_text = raw_data.get("ocr_text", "") or ""
         schema.raw_text = ocr_text
         if ocr_text:
-            de = delivery_extractor.extract(ocr_text)
-            schema.delivery_extraction = de.as_dict()
+            context = {
+                "merchant": schema.merchant.name,
+                "total": schema.payment.total,
+            }
+            de = gemini_delivery_extractor.extract(ocr_text, context=context)
+            schema.delivery_extraction = de
 
-            # Propaga campos de alta confiança para o schema principal
-            if de.customer_name.value and not schema.customer.name:
-                schema.customer.name = de.customer_name.value
-            if de.phone.value and not schema.customer.phone:
-                schema.customer.phone = de.phone.value
-            if de.address_raw.value and not schema.delivery.address_raw:
-                schema.delivery.address_raw = de.address_raw.value
-            if de.neighborhood.value:
-                schema.delivery.neighborhood = de.neighborhood.value
-            if de.city.value:
-                schema.delivery.city = de.city.value
-            if de.state.value:
-                schema.delivery.state = de.state.value
-            if de.delivery_time.value:
-                schema.document.issue_time = de.delivery_time.value
+            # Propaga campos para o schema principal
+            if de.get("customer_name") and not schema.customer.name:
+                schema.customer.name = de["customer_name"]
+            if de.get("customer_phone") and not schema.customer.phone:
+                schema.customer.phone = de["customer_phone"]
+            if de.get("delivery_address_raw") and not schema.delivery.address_raw:
+                schema.delivery.address_raw = de["delivery_address_raw"]
+            if de.get("neighborhood"):
+                schema.delivery.neighborhood = de["neighborhood"]
+            if de.get("city"):
+                schema.delivery.city = de["city"]
+            if de.get("state"):
+                schema.delivery.state = de["state"]
+            if de.get("zip_code"):
+                schema.delivery.zip_code = de["zip_code"]
 
-            # Se revisão necessária, marca no validation
-            if de.precisa_revisao:
+            # Decisão de revisão humana
+            if de.get("needs_human_review"):
                 schema.validation.needs_human_review = True
-                schema.validation.warnings.append(
-                    f"Dados de entrega com baixa confiança ({de.overall_confidence:.0%}). Revisão necessária."
-                )
+                for r in de.get("reason", []):
+                    schema.validation.warnings.append(r)
 
         return schema
-
-    def _extract_delivery_from_text(self, text: str, schema: ReceiptStandardSchema):
-        """Mantido por compatibilidade — use delivery_extractor diretamente."""
-        pass
 
 
 
