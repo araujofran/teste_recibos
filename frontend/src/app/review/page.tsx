@@ -209,13 +209,70 @@ export default function ReviewPage() {
                           <p className="font-bold text-indigo-600">R$ {selectedExtraction.normalized_json.payment.total?.toFixed(2) || '0.00'}</p>
                         </div>
                       </div>
-                      
-                      <div className="p-2 bg-white rounded border border-slate-200">
-                        <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Endereço Extraído</p>
-                        <p className="text-xs text-slate-700">{selectedExtraction.normalized_json.delivery.address_raw || '---'}</p>
-                      </div>
 
-                      <div className="mt-4">
+                      {/* Dados do Cliente de Entrega */}
+                      {(() => {
+                        const de = selectedExtraction.normalized_json.delivery_extraction;
+                        const conf = de?.overall_confidence ?? 0;
+                        const needsReview = de?.precisa_revisao ?? false;
+                        return (
+                          <div className={`p-3 rounded border ${needsReview ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-200'}`}>
+                            <div className="flex items-center justify-between mb-2">
+                              <p className={`text-[10px] font-bold uppercase ${needsReview ? 'text-red-700' : 'text-amber-700'}`}>
+                                📦 Dados de Entrega
+                              </p>
+                              <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-1">
+                                  <div className="w-16 h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                                    <div className={`h-full rounded-full ${conf >= 0.7 ? 'bg-green-500' : conf >= 0.4 ? 'bg-yellow-500' : 'bg-red-500'}`} style={{width: `${conf * 100}%`}}/>
+                                  </div>
+                                  <span className="text-[9px] text-slate-500">{Math.round(conf * 100)}%</span>
+                                </div>
+                                {needsReview && (
+                                  <span className="text-[9px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded-full font-bold">⚠ REVISAR</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2 text-xs">
+                              <div>
+                                <p className="text-[10px] text-slate-400 font-bold uppercase">Cliente</p>
+                                <p className="font-semibold text-slate-800">
+                                  {de?.customer_name?.value || selectedExtraction.normalized_json.customer?.name || '---'}
+                                  {de?.customer_name?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.customer_name.confidence*100)}%)</span>}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-[10px] text-slate-400 font-bold uppercase">Telefone</p>
+                                <p className="font-semibold text-slate-800">
+                                  {de?.phone?.value || selectedExtraction.normalized_json.customer?.phone || '---'}
+                                  {de?.phone?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.phone.confidence*100)}%)</span>}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="mt-2">
+                              <p className="text-[10px] text-slate-400 font-bold uppercase">Endereço de Entrega</p>
+                              <p className="text-xs text-slate-700 font-medium mt-0.5">
+                                {de?.address_raw?.value || selectedExtraction.normalized_json.delivery?.address_raw || '---'}
+                                {de?.address_raw?.confidence > 0 && <span className="text-[8px] text-slate-400 ml-1">({Math.round(de.address_raw.confidence*100)}%)</span>}
+                              </p>
+                              {(de?.neighborhood?.value || de?.city?.value) && (
+                                <p className="text-[10px] text-slate-500 mt-0.5">
+                                  {[de?.neighborhood?.value, de?.city?.value, de?.state?.value].filter(Boolean).join(' - ')}
+                                </p>
+                              )}
+                            </div>
+                            {de?.delivery_time?.value && (
+                              <div className="mt-2">
+                                <p className="text-[10px] text-slate-400 font-bold uppercase">Hora p/ Entrega</p>
+                                <p className={`text-xs font-bold ${needsReview ? 'text-red-700' : 'text-amber-700'}`}>{de.delivery_time.value}</p>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+
+
+                      <div className="mt-2">
                         <p className="text-[10px] text-slate-400 font-bold uppercase mb-2">Itens ({selectedExtraction.normalized_json.items.length})</p>
                         <div className="space-y-1">
                           {selectedExtraction.normalized_json.items.map((item: any, i: number) => (
@@ -226,6 +283,7 @@ export default function ReviewPage() {
                           ))}
                         </div>
                       </div>
+
                       
                       <details className="mt-4">
                         <summary className="text-[10px] text-slate-400 font-bold cursor-pointer hover:text-slate-600">Ver JSON Completo</summary>

@@ -9,11 +9,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from collections import deque
 from app.schemas import ReceiptStandardSchema, ItemSchema
+from app.services.delivery_extractor import delivery_extractor
 from dotenv import load_dotenv
 
 load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
+
 
 # ─── Rate Limiter ──────────────────────────────────────────────────────────────
 class RateLimiter:
@@ -273,26 +275,19 @@ class VeryfiProvider(ReceiptProviderInterface):
         if not self.api_key or not self.client_id:
             return {"error": "Veryfi: configure VERYFI_CLIENT_ID, VERYFI_USERNAME e VERYFI_API_KEY no .env"}
         try:
-            url = f"{self.base_url}/documents"
-            headers = {
-                "CLIENT-ID": self.client_id,
-                "Authorization": f"apikey {self.username}:{self.api_key}",
-                "Accept": "application/json",
-            }
-            with open(file_path, "rb") as f:
-                ext = file_path.lower().split(".")[-1]
-                mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}
-                mime = mime_map.get(ext, "image/jpeg")
-                files = {"file": (os.path.basename(file_path), f, mime)}
-                response = requests.post(url, headers=headers, files=files, timeout=30)
-
-            if response.status_code not in (200, 201):
-                return {"error": f"Veryfi API Error {response.status_code}: {response.text[:200]}"}
-
-            return response.json()
+            from veryfi import Client as VeryfiClient
+            client = VeryfiClient(
+                client_id=self.client_id,
+                client_secret=os.getenv("VERYFI_CLIENT_SECRET", ""),
+                username=self.username,
+                api_key=self.api_key
+            )
+            result = client.process_document(file_path)
+            return result
         except Exception as e:
             logger.error(f"Erro Veryfi: {str(e)}")
             return {"error": str(e)}
+
 
     def normalize(self, raw_data: dict) -> ReceiptStandardSchema:
         if "error" in raw_data:
@@ -307,6 +302,7 @@ class VeryfiProvider(ReceiptProviderInterface):
         schema.merchant.address = vendor.get("address") or raw_data.get("vendor_address")
 
         schema.document.issue_date = raw_data.get("date")
+        schema.document.number = str(raw_data.get("invoice_number") or "")
 
         schema.payment.total = raw_data.get("total")
         schema.payment.subtotal = raw_data.get("subtotal")
@@ -324,7 +320,43 @@ class VeryfiProvider(ReceiptProviderInterface):
             except Exception:
                 continue
 
+        # ── Segunda camada: DeliveryDataExtractor ──────────────────────────────
+        ocr_text = raw_data.get("ocr_text", "") or ""
+        schema.raw_text = ocr_text
+        if ocr_text:
+            de = delivery_extractor.extract(ocr_text)
+            schema.delivery_extraction = de.as_dict()
+
+            # Propaga campos de alta confiança para o schema principal
+            if de.customer_name.value and not schema.customer.name:
+                schema.customer.name = de.customer_name.value
+            if de.phone.value and not schema.customer.phone:
+                schema.customer.phone = de.phone.value
+            if de.address_raw.value and not schema.delivery.address_raw:
+                schema.delivery.address_raw = de.address_raw.value
+            if de.neighborhood.value:
+                schema.delivery.neighborhood = de.neighborhood.value
+            if de.city.value:
+                schema.delivery.city = de.city.value
+            if de.state.value:
+                schema.delivery.state = de.state.value
+            if de.delivery_time.value:
+                schema.document.issue_time = de.delivery_time.value
+
+            # Se revisão necessária, marca no validation
+            if de.precisa_revisao:
+                schema.validation.needs_human_review = True
+                schema.validation.warnings.append(
+                    f"Dados de entrega com baixa confiança ({de.overall_confidence:.0%}). Revisão necessária."
+                )
+
         return schema
+
+    def _extract_delivery_from_text(self, text: str, schema: ReceiptStandardSchema):
+        """Mantido por compatibilidade — use delivery_extractor diretamente."""
+        pass
+
+
 
 
 # ─── Mock ─────────────────────────────────────────────────────────────────────
