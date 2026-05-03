@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List
@@ -25,6 +26,8 @@ app.add_middleware(
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.get("/")
 def read_root():
@@ -61,14 +64,15 @@ def list_images(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
 
 @app.post("/extract/{image_id}")
 def run_extraction(image_id: str, provider: str = "mock", db: Session = Depends(get_db)):
-    from .services.ocr_service import get_ocr_provider
+    from .services.ocr_service import get_receipt_provider
     import json
     
     image = db.query(models.ReceiptImage).filter(models.ReceiptImage.id == image_id).first()
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
         
-    ocr = get_ocr_provider(provider)
+    ocr = get_receipt_provider(provider)
+
     
     # 1. Extract raw data
     raw_data = ocr.extract_receipt(image.file_url)
@@ -96,20 +100,27 @@ def run_extraction(image_id: str, provider: str = "mock", db: Session = Depends(
     
     return {"extraction_id": extraction.id, "status": "success", "normalized": extraction.normalized_json}
 
+@app.get("/extractions/{image_id}")
+def list_extractions(image_id: str, db: Session = Depends(get_db)):
+    extractions = db.query(models.ReceiptExtraction).filter(models.ReceiptExtraction.image_id == image_id).all()
+    return extractions
+
+
 @app.post("/ground_truth/")
-def save_ground_truth(image_id: str, manual_json: dict, db: Session = Depends(get_db)):
-    image = db.query(models.ReceiptImage).filter(models.ReceiptImage.id == image_id).first()
+def save_ground_truth(payload: schemas.GroundTruthCreate, db: Session = Depends(get_db)):
+    image = db.query(models.ReceiptImage).filter(models.ReceiptImage.id == payload.image_id).first()
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
         
     gt = models.ReceiptGroundTruth(
-        image_id=image_id,
-        manual_json=manual_json
+        image_id=payload.image_id,
+        manual_json=payload.manual_json
     )
     db.add(gt)
     db.commit()
     db.refresh(gt)
     return {"ground_truth_id": gt.id, "status": "success"}
+
 
 @app.post("/validate/{extraction_id}")
 def run_validation(extraction_id: str, db: Session = Depends(get_db)):

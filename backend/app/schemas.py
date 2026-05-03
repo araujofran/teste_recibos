@@ -76,3 +76,8 @@ class ReceiptStandardSchema(BaseModel):
     raw_text: Optional[str] = None
     confidence: ConfidenceSchema = Field(default_factory=ConfidenceSchema)
     validation: ValidationSchema = Field(default_factory=ValidationSchema)
+
+class GroundTruthCreate(BaseModel):
+    image_id: str
+    manual_json: dict
+

@@ -4,6 +4,7 @@ backend/__pycache__/
 backend/*.db
 backend/uploads/
 backend/.env
+.env
 
 # Frontend
 frontend/node_modules/
@@ -18,3 +19,6 @@ frontend/.env.production.local
 .DS_Store
 *.log
 .vscode/
+recibos/
+**/__pycache__/
+*.pyc

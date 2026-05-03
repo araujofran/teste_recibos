@@ -14,6 +14,8 @@ export default function ReviewPage() {
   const [groundTruth, setGroundTruth] = useState<string>("");
   const [validation, setValidation] = useState<any>(null);
   const [loading, setLoading] = useState(false);
+  const [selectedProvider, setSelectedProvider] = useState<string>("gemini");
+
 
   useEffect(() => {
     fetchImages();
@@ -32,9 +34,22 @@ export default function ReviewPage() {
     setSelectedImage(img);
     setSelectedExtraction(null);
     setValidation(null);
-    // In a real app, we'd fetch extractions for this image
-    // For now, let's assume we trigger a fresh one or list them if we had an endpoint
+    fetchExtractions(img.id);
   };
+
+  const fetchExtractions = async (imageId: string) => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/extractions/${imageId}`);
+      setExtractions(res.data);
+      if (res.data.length > 0) {
+        setSelectedExtraction(res.data[res.data.length - 1]);
+        setGroundTruth(JSON.stringify(res.data[res.data.length - 1].normalized_json, null, 2));
+      }
+    } catch (err) {
+      console.error("Error fetching extractions", err);
+    }
+  };
+
 
   const handleValidate = async () => {
     if (!selectedExtraction) return;
@@ -47,7 +62,7 @@ export default function ReviewPage() {
       });
 
       // 2. Run Validation
-      const res = await axios.post(`${API_BASE_URL}/validate/${selectedExtraction.id}`);
+      const res = await axios.post(`${API_BASE_URL}/validate/${selectedExtraction.extraction_id}`);
       setValidation(res.data);
     } catch (err) {
       alert("Erro na validação. Verifique o formato do JSON de Ground Truth.");
@@ -99,44 +114,134 @@ export default function ReviewPage() {
         <div className="col-span-9 grid grid-rows-2 gap-6">
           {/* Top: Image Preview & JSON Extraction */}
           <div className="grid grid-cols-2 gap-6">
-            <div className="bg-slate-200 rounded-2xl overflow-hidden border border-slate-300 relative group flex items-center justify-center">
+            <div className="bg-slate-200 rounded-2xl overflow-hidden border border-slate-300 relative group flex items-center justify-center bg-checkered">
               {selectedImage ? (
-                <div className="text-slate-500 flex flex-col items-center">
-                   <p className="text-sm font-medium">Visualização da Imagem</p>
-                   <p className="text-xs">{selectedImage.file_url}</p>
-                   {/* In a real app: <img src={selectedImage.url} /> */}
-                </div>
+                <img 
+                  src={`${API_BASE_URL}/${selectedImage.file_url}`} 
+                  alt="Recibo" 
+                  className="max-h-full max-w-full object-contain"
+                />
               ) : (
                 <p className="text-slate-400 italic">Selecione um recibo</p>
               )}
             </div>
 
+
             <div className="bg-white rounded-2xl border border-slate-200 shadow-sm flex flex-col overflow-hidden">
-               <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
-                  <span className="text-sm font-bold text-slate-700 uppercase tracking-tight">Extração Automática</span>
-                  {selectedImage && !selectedExtraction && (
+                <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                  <div className="flex items-center gap-4">
+                    <span className="text-sm font-bold text-slate-700 uppercase tracking-tight">Extração Automática</span>
+                    <select 
+                      value={selectedProvider} 
+                      onChange={(e) => setSelectedProvider(e.target.value)}
+                      className="text-xs border border-slate-300 rounded px-2 py-1 bg-white outline-none focus:ring-1 focus:ring-indigo-500"
+                    >
+                      <option value="auto">🔄 Auto (Fallback Chain)</option>
+                      <option value="gemini">Google Gemini ✨</option>
+                      <option value="mock">Simulador (Mock)</option>
+                      <option value="veryfi">Veryfi</option>
+                      <option value="mindee">Mindee</option>
+
+                    </select>
+                  </div>
+                  {selectedImage && (
                     <button 
                       onClick={async () => {
-                        const res = await axios.post(`${API_BASE_URL}/extract/${selectedImage.id}`);
-                        setSelectedExtraction(res.data);
-                        // Mock ground truth for easy testing
-                        setGroundTruth(JSON.stringify(res.data.normalized, null, 2));
+                        setLoading(true);
+                        try {
+                          const res = await axios.post(`${API_BASE_URL}/extract/${selectedImage.id}?provider=${selectedProvider}`);
+                          // Update extraction list
+                          fetchExtractions(selectedImage.id);
+                        } catch (err) {
+                          alert("Erro ao rodar extração. Verifique as chaves de API no backend.");
+                        } finally {
+                          setLoading(false);
+                        }
                       }}
-                      className="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded-lg hover:bg-indigo-700 flex items-center gap-1.5 font-medium transition-all"
+                      disabled={loading}
+                      className="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded-lg hover:bg-indigo-700 flex items-center gap-1.5 font-medium transition-all disabled:opacity-50"
                     >
-                      <Play size={12} /> Rodar OCR
+                      {loading ? <RefreshCw className="animate-spin" size={12} /> : <Play size={12} />}
+                      Rodar {selectedProvider.toUpperCase()}
                     </button>
                   )}
                </div>
-               <div className="flex-1 p-4 overflow-auto font-mono text-[10px] bg-slate-50 text-slate-600">
+               
+               {/* Extraction History Tabs */}
+               {extractions.length > 1 && (
+                 <div className="px-4 py-2 border-b border-slate-100 flex gap-2 bg-white overflow-x-auto">
+                    {extractions.map((ext, i) => (
+                      <button 
+                        key={ext.id}
+                        onClick={() => {
+                          setSelectedExtraction(ext);
+                          // We use normalized_json because that's what comes from the backend listing
+                          setGroundTruth(JSON.stringify(ext.normalized_json, null, 2));
+                        }}
+                        className={`text-[10px] px-2 py-1 rounded-full border transition-all whitespace-nowrap ${
+                          selectedExtraction?.id === ext.id ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'
+                        }`}
+                      >
+                        V{i+1} - {ext.provider_id?.split('-')[0] || 'OCR'}
+                      </button>
+                    ))}
+                 </div>
+               )}
+
+               <div className="flex-1 p-4 overflow-auto bg-slate-50 text-slate-600">
                   {selectedExtraction ? (
-                    <pre>{JSON.stringify(selectedExtraction.normalized, null, 2)}</pre>
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div className="p-2 bg-white rounded border border-slate-200">
+                          <p className="text-[10px] text-slate-400 font-bold uppercase">Empresa</p>
+                          <p className="font-semibold text-slate-800">{selectedExtraction.normalized_json.merchant.name || '---'}</p>
+                        </div>
+                        <div className="p-2 bg-white rounded border border-slate-200">
+                          <p className="text-[10px] text-slate-400 font-bold uppercase">CNPJ</p>
+                          <p className="font-semibold text-slate-800">{selectedExtraction.normalized_json.merchant.cnpj || '---'}</p>
+                        </div>
+                        <div className="p-2 bg-white rounded border border-slate-200">
+                          <p className="text-[10px] text-slate-400 font-bold uppercase">Data</p>
+                          <p className="font-semibold text-slate-800">{selectedExtraction.normalized_json.document.issue_date || '---'}</p>
+                        </div>
+                        <div className="p-2 bg-white rounded border border-slate-200">
+                          <p className="text-[10px] text-slate-400 font-bold uppercase">Total</p>
+                          <p className="font-bold text-indigo-600">R$ {selectedExtraction.normalized_json.payment.total?.toFixed(2) || '0.00'}</p>
+                        </div>
+                      </div>
+                      
+                      <div className="p-2 bg-white rounded border border-slate-200">
+                        <p className="text-[10px] text-slate-400 font-bold uppercase mb-1">Endereço Extraído</p>
+                        <p className="text-xs text-slate-700">{selectedExtraction.normalized_json.delivery.address_raw || '---'}</p>
+                      </div>
+
+                      <div className="mt-4">
+                        <p className="text-[10px] text-slate-400 font-bold uppercase mb-2">Itens ({selectedExtraction.normalized_json.items.length})</p>
+                        <div className="space-y-1">
+                          {selectedExtraction.normalized_json.items.map((item: any, i: number) => (
+                            <div key={i} className="flex justify-between text-[10px] p-1.5 bg-white rounded border border-slate-100">
+                              <span className="truncate max-w-[150px]">{item.description}</span>
+                              <span className="font-bold">x{item.quantity} - R$ {item.total_price?.toFixed(2)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      
+                      <details className="mt-4">
+                        <summary className="text-[10px] text-slate-400 font-bold cursor-pointer hover:text-slate-600">Ver JSON Completo</summary>
+                        <pre className="mt-2 text-[9px] font-mono bg-slate-100 p-2 rounded overflow-auto max-h-40">
+                          {JSON.stringify(selectedExtraction.normalized_json, null, 2)}
+                        </pre>
+                      </details>
+                    </div>
                   ) : (
                     <div className="h-full flex items-center justify-center italic text-slate-400">
                        Aguardando OCR...
                     </div>
                   )}
                </div>
+
+
             </div>
           </div>
 
