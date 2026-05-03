@@ -174,36 +174,53 @@ import base64 as b64lib, tempfile, json as jsonlib
 class ROIRequest(PydanticBase):
     image_base64: str   # data:image/jpeg;base64,....
 
+def _build_empty_de() -> dict:
+    return {
+        "customer_name": "", "customer_phone": "", "delivery_address_raw": "",
+        "street": "", "number": "", "complement": "", "neighborhood": "",
+        "city": "", "state": "", "zip_code": "", "reference": "",
+        "confidence": {"customer_name": 0.0, "customer_phone": 0.0, "address": 0.0, "overall": 0.0},
+        "evidence": {"customer_name_text": "", "phone_text": "", "address_text": ""},
+        "needs_human_review": True, "auto_approve_logistics": False, "reason": []
+    }
+
 @app.post("/extract-region/{image_id}")
 async def extract_region(image_id: str, body: ROIRequest, db: Session = Depends(get_db)):
     """
-    Recebe uma região da imagem (base64) selecionada pelo usuário,
-    envia ao GeminiDeliveryExtractor e salva como nova extração.
-    """
-    from .services.gemini_delivery_extractor import gemini_delivery_extractor
+    Extrai dados de entrega de uma região da imagem selecionada pelo usuário.
 
-    # Decodifica base64
+    Fallback em cascata:
+      1. Gemini Vision (semântico, mais preciso)
+      2. Veryfi OCR text + DeliveryDataExtractor (regex híbrido)
+      3. DeliveryDataExtractor puro na imagem (regex no tmp file)
+    """
+    import os, re
+    from .services.delivery_extractor import delivery_extractor as regex_extractor
+
+    # ── Decodifica base64 ──────────────────────────────────────────────────────
     try:
         header, b64data = body.image_base64.split(",", 1)
         img_bytes = b64lib.b64decode(b64data)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"base64 inválido: {e}")
 
-    # Salva imagem recortada temporariamente para OCR de texto
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
         tmp.write(img_bytes)
         tmp_path = tmp.name
 
+    de_result = None
+    provider_used = "gemini-roi"
+    raw_text_used = ""
+
     try:
-        # Usa Gemini Vision diretamente na região (mais preciso que raw_text)
+        # ── 1. Gemini Vision ───────────────────────────────────────────────────
         import google.generativeai as genai
-        import os
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         model = genai.GenerativeModel("gemini-2.0-flash")
 
-        prompt = """Você é um extrator de dados de entrega.
-Analise esta imagem (recorte de um recibo) e extraia SOMENTE os dados de entrega.
-Retorne EXCLUSIVAMENTE JSON válido:
+        prompt = """Você é um extrator de dados de entrega de recibos brasileiros.
+Analise esta imagem (recorte de um recibo) e extraia os dados de entrega.
+Retorne EXCLUSIVAMENTE JSON válido (sem texto extra):
 {
   "customer_name": "",
   "customer_phone": "",
@@ -216,68 +233,118 @@ Retorne EXCLUSIVAMENTE JSON válido:
   "needs_human_review": true,
   "reason": []
 }
-Não invente dados. Se não tiver certeza, deixe o campo vazio."""
+Regras: não invente dados; confidence 0.0-1.0; se não achar, campo vazio."""
 
         img_part = {"mime_type": "image/jpeg", "data": img_bytes}
-        response = model.generate_content([prompt, img_part])
+        response = model.generate_content([prompt, img_part], generation_config={"temperature": 0.0})
         content = response.text.strip()
-
         if "```json" in content:
             content = content.split("```json")[1].split("```")[0]
         elif "```" in content:
             content = content.split("```")[1].split("```")[0]
-
         de_result = jsonlib.loads(content.strip())
         de_result["auto_approve_logistics"] = de_result.get("confidence", {}).get("overall", 0) >= 0.85
+        provider_used = "gemini-roi"
 
-    except Exception as e:
-        de_result = {
-            "customer_name": "", "customer_phone": "", "delivery_address_raw": "",
-            "street": "", "number": "", "complement": "", "neighborhood": "",
-            "city": "", "state": "", "zip_code": "", "reference": "",
-            "confidence": {"customer_name": 0, "customer_phone": 0, "address": 0, "overall": 0},
-            "evidence": {"customer_name_text": "", "phone_text": "", "address_text": ""},
-            "needs_human_review": True,
-            "auto_approve_logistics": False,
-            "reason": [f"Erro Gemini ROI: {str(e)}"]
-        }
-    finally:
+    except Exception as gemini_err:
+        logger.warning(f"[ROI] Gemini falhou ({gemini_err}), tentando Veryfi...")
+
+        try:
+            # ── 2. Veryfi OCR → delivery_extractor regex ─────────────────────
+            veryfi_client_id     = os.getenv("VERYFI_CLIENT_ID")
+            veryfi_client_secret = os.getenv("VERYFI_CLIENT_SECRET")
+            veryfi_username      = os.getenv("VERYFI_USERNAME")
+            veryfi_api_key       = os.getenv("VERYFI_API_KEY")
+
+            if veryfi_api_key and veryfi_client_id:
+                from veryfi import Client as VeryfiClient
+                vclient = VeryfiClient(
+                    client_id=veryfi_client_id,
+                    client_secret=veryfi_client_secret,
+                    username=veryfi_username,
+                    api_key=veryfi_api_key
+                )
+                veryfi_raw = vclient.process_document(tmp_path)
+                ocr_text = veryfi_raw.get("ocr_text", "") or ""
+                raw_text_used = ocr_text
+
+                if ocr_text.strip():
+                    extracted = regex_extractor.extract(ocr_text)
+                    de_result = {
+                        "customer_name": extracted.customer_name.value or "",
+                        "customer_phone": extracted.phone.value or "",
+                        "delivery_address_raw": extracted.address_raw.value or "",
+                        "street": "",
+                        "number": extracted.number.value or "",
+                        "complement": extracted.complement.value or "",
+                        "neighborhood": extracted.neighborhood.value or "",
+                        "city": extracted.city.value or "",
+                        "state": extracted.state.value or "",
+                        "zip_code": "",
+                        "reference": extracted.reference.value or "",
+                        "confidence": {
+                            "customer_name": extracted.customer_name.confidence,
+                            "customer_phone": extracted.phone.confidence,
+                            "address": extracted.address_raw.confidence,
+                            "overall": extracted.overall_confidence,
+                        },
+                        "evidence": {"customer_name_text": "", "phone_text": "", "address_text": ""},
+                        "needs_human_review": extracted.precisa_revisao,
+                        "auto_approve_logistics": extracted.overall_confidence >= 0.85,
+                        "reason": [f"Gemini indisponível ({type(gemini_err).__name__}), usado Veryfi+regex"],
+                    }
+                    provider_used = "veryfi-roi+regex"
+
+        except Exception as veryfi_err:
+            logger.warning(f"[ROI] Veryfi também falhou ({veryfi_err})")
+
+    # ── 3. Fallback final ─────────────────────────────────────────────────────
+    if de_result is None:
+        de_result = _build_empty_de()
+        de_result["reason"] = ["Gemini e Veryfi indisponíveis. Revisão manual necessária."]
+        provider_used = "roi-manual"
+
+    # Limpa arquivo temporário
+    try:
         os.unlink(tmp_path)
+    except Exception:
+        pass
 
-    # Monta schema padronizado
+    # ── Monta schema padronizado ──────────────────────────────────────────────
     normalized = {
-        "provider": "gemini-roi",
+        "provider": provider_used,
         "document_id": None,
         "image_id": image_id,
         "merchant": {"name": None, "cnpj": None, "address": None, "phone": None},
         "document": {"issue_date": None, "issue_time": None, "number": None},
         "customer": {
-            "name": de_result.get("customer_name"),
-            "phone": de_result.get("customer_phone"),
+            "name": de_result.get("customer_name") or None,
+            "phone": de_result.get("customer_phone") or None,
         },
         "delivery": {
-            "address_raw": de_result.get("delivery_address_raw"),
-            "street": de_result.get("street"),
-            "number": de_result.get("number"),
-            "complement": de_result.get("complement"),
-            "neighborhood": de_result.get("neighborhood"),
-            "city": de_result.get("city"),
-            "state": de_result.get("state"),
-            "zip_code": de_result.get("zip_code"),
-            "reference": de_result.get("reference"),
+            "address_raw": de_result.get("delivery_address_raw") or None,
+            "street":       de_result.get("street") or None,
+            "number":       de_result.get("number") or None,
+            "complement":   de_result.get("complement") or None,
+            "neighborhood": de_result.get("neighborhood") or None,
+            "city":         de_result.get("city") or None,
+            "state":        de_result.get("state") or None,
+            "zip_code":     de_result.get("zip_code") or None,
+            "reference":    de_result.get("reference") or None,
         },
         "items": [],
         "payment": {"total": None, "subtotal": None, "delivery_fee": None, "payment_method": None},
-        "raw_text": None,
+        "raw_text": raw_text_used or None,
         "delivery_extraction": de_result,
-        "confidence": {"status": None, "score": None, "errors": [], "warnings": [], "needs_human_review": de_result.get("needs_human_review", True)},
-        "validation": {"status": None, "score": None, "errors": [], "warnings": [], "needs_human_review": de_result.get("needs_human_review", True)},
+        "confidence": {"status": None, "score": None, "errors": [], "warnings": [],
+                       "needs_human_review": de_result.get("needs_human_review", True)},
+        "validation":  {"status": None, "score": None, "errors": [], "warnings": [],
+                        "needs_human_review": de_result.get("needs_human_review", True)},
     }
 
-    # Salva extração
     extraction = models.ReceiptExtraction(
         image_id=image_id,
-        provider_id="gemini-roi",
+        provider_id=provider_used,
         raw_json=de_result,
         normalized_json=normalized,
         status="roi_extracted"
@@ -286,4 +353,4 @@ Não invente dados. Se não tiver certeza, deixe o campo vazio."""
     db.commit()
     db.refresh(extraction)
 
-    return {"extraction_id": extraction.id, "provider": "gemini-roi", "result": de_result}
+    return {"extraction_id": extraction.id, "provider": provider_used, "result": de_result}
